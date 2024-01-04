@@ -166,7 +166,7 @@ function update_results!(results::OptimizationResults, state::IterationState, it
         results.minimizer .= state.x
         results.minimum = current_objective_value
     end
-    println(results.minimum)
+    # println(results.minimum)
 end
 
 function assess_convergence(prob::FISTA, state::IterationState)
@@ -180,12 +180,12 @@ function assess_convergence(prob::FISTA, state::IterationState)
     end
 end
 
-mutable struct BarzilaiBorweinMethod
-    γ
-    η
+mutable struct BBMethod
     Q
-    C
-    BarzilaiBorweinMethod(γ=1e-4, η=0.85, Q=1.0; C) = new(γ, η, Q, C)
+    gamma
+    rhols
+    Cval
+    BBMethod(Q=1.0, gamma=0.85, rhols=1e-6; Cval) = new(Q, gamma, rhols, Cval)
 end
 
 function set_step!(state::IterationState, iteration::Integer)
@@ -200,16 +200,35 @@ function set_step!(state::IterationState, iteration::Integer)
             state.α = dxg / (dg' * dg)
         end
     else
-        state.α = 1e-8
+        state.α = 1e-5
     end
 
-    state.α = max(min(state.α, 1e20), 1e-20)
+    state.α = max(min(state.α, 1e12), 1e-12)
 end
 
-# function linear_search!(state::IterationState, 
-#     ls_state::BarzilaiBorweinMethod, prob::FISTA)
+function linear_search!(state::IterationState,
+    bb::BBMethod, prob::FISTA, k::Integer)
 
-# end
+    loop_count = 1
+
+    θ = (k - 1) / (k + 2)
+    y = state.x + θ * (state.x - state.x_previous)
+    w = y .- state.α .* gradient(prob, y)
+    x_tmp = proximal(prob, state, w)
+    f_tmp = objective_value(prob, x_tmp)
+
+    while loop_count <= 1000 && f_tmp > bb.Cval - 0.5 * state.α * bb.rhols * norm(x_tmp - y, 2)^2
+        state.α *= 0.2
+        loop_count += 1
+        w .= y .- state.α .* gradient(prob, y)
+        x_tmp = proximal(prob, state, w)
+        f_tmp = objective_value(prob, x_tmp)
+    end
+    Qp = bb.Q
+    bb.Q = bb.gamma * Qp + 1
+    bb.Cval = (bb.gamma * Qp * bb.Cval + f_tmp) / bb.Q
+    println(state.α)
+end
 
 function optimize(A, b, μ; iterations=1_000)
     prob = FISTA(A, b, μ; iterations)
@@ -217,19 +236,18 @@ function optimize(A, b, μ; iterations=1_000)
     results = OptimizationResults(prob)
     results.initial_x = state.x
     initial_f_x = objective_value(prob, results.initial_x)
-    # linear_search_state = BarzilaiBorweinMethod(C=initial_f_x)
+    bb = BBMethod(Cval=state.f_x)
 
     for k = 1:prob.iterations
-        # linear_search!(state, linear_search_state, prob)
-        update_state!(state, prob, k)
-        update_results!(results, state, k, prob)
         if k > 2 && assess_convergence(prob, state)
             results.iteration_converged = true
             results.iterations = k
-            println(k)
             break
         end
         set_step!(state, k)
+        linear_search!(state, bb, prob, k)
+        update_state!(state, prob, k)
+        update_results!(results, state, k, prob)
     end
 
     return results
@@ -243,7 +261,6 @@ function test()
     b = A * u
     μ = 1e-3
     results = optimize(A, b, μ; iterations=1000)
-    println(results.iteration_converged)
 
     it = 100
 
