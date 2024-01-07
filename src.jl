@@ -1,60 +1,7 @@
-import LinearAlgebra: norm
+import LinearAlgebra: norm, eigvals
 using SparseArrays
 using Plots
 using LaTeXStrings
-
-# """
-# State:
-#     x
-#     x_previous
-#     f_x
-#     f_x_previous
-#     g
-#     g_previous
-
-# Options:
-#     x_tol = nothing,
-#     f_tol = nothing,
-#     g_tol = nothing,
-#     x_abstol::Real = 0.0,
-#     x_reltol::Real = 0.0,
-#     f_abstol::Real = 0.0,
-#     f_reltol::Real = 0.0,
-#     g_abstol::Real = 1e-8,
-#     g_reltol::Real = 1e-8,
-#     iterations::Int = 1_000,
-
-
-# 最后从options中构造并返回
-# MultivariateOptimizationResults:
-#     method::O
-#     initial_x::Tx
-#     minimizer::Tx
-#     minimum::Tf
-#     iterations::Int
-#     iteration_converged::Bool
-#     x_converged::Bool
-#     x_abstol::Tf
-#     x_reltol::Tf
-#     x_abschange::Tc
-#     x_relchange::Tc
-#     f_converged::Bool
-#     f_abstol::Tf
-#     f_reltol::Tf
-#     f_abschange::Tc
-#     f_relchange::Tc
-#     g_converged::Bool
-#     g_abstol::Tf
-#     g_residual::Tc
-
-
-# assess_convergence 写一个函数判断是否收敛   
-
-# 进行线性搜索
-# state.alpha, ϕalpha = method.linesearch!(d, state.x, state.s, state.alpha,
-#                    state.x_ls, phi_0, dphi_0)
-
-# """
 
 struct FISTA{T<:AbstractFloat}
     A::AbstractMatrix{T}
@@ -114,6 +61,7 @@ mutable struct IterationState{T<:AbstractFloat}
     g::AbstractVector{T}
     g_previous::AbstractVector{T}
     α::T
+    const α₀::T
 end
 
 function IterationState(prob::FISTA{T}) where {T<:AbstractFloat}
@@ -121,7 +69,7 @@ function IterationState(prob::FISTA{T}) where {T<:AbstractFloat}
     g_previous = gradient(prob, x_previous)
     x = randn(T, prob.x_dimension)
     g = gradient(prob, x)
-    initial_α = 1e-8
+    initial_α = eigvals(prob.A' * prob.A)[end]
 
     state = IterationState{T}(
         x,
@@ -130,13 +78,14 @@ function IterationState(prob::FISTA{T}) where {T<:AbstractFloat}
         objective_value(prob, x_previous),
         g,
         g_previous,
+        initial_α,
         initial_α
     )
     return state
 end
 
 function proximal(prob::FISTA, state::IterationState, x::AbstractArray)
-    sign.(x) .* max.(abs.(x) .- state.α * prob.μ, 0)
+    @. sign(x) * max(abs(x) - state.α * prob.μ, 0)
 end
 
 function gradient(prob::FISTA, y::AbstractArray)
@@ -157,22 +106,19 @@ function update_state!(state::IterationState, prob::FISTA, k::Integer)
     state.g .= gradient(prob, state.x)
 end
 
-function update_results!(results::OptimizationResults, state::IterationState, iteration::Integer, prob::FISTA)
+function update_results!(results::OptimizationResults, state::IterationState,
+    iteration::Integer, prob::FISTA)
     current_objective_value = objective_value(prob, state.x)
-    # println(current_objective_value)
     results.f_historical_values[iteration] = current_objective_value
-
     if current_objective_value < results.minimum
         results.minimizer .= state.x
         results.minimum = current_objective_value
     end
-    # println(results.minimum)
 end
 
 function assess_convergence(prob::FISTA, state::IterationState)
     is_f_x_converged = abs(state.f_x - state.f_x_previous) < prob.f_tol
     is_g_converged = norm(state.g - state.g_previous, 2) < prob.g_tol
-
     if is_f_x_converged || is_g_converged
         true
     else
@@ -192,7 +138,6 @@ function set_step!(state::IterationState, iteration::Integer)
     dx = state.x .- state.x_previous
     dg = state.g .- state.g_previous
     dxg = abs(dx' * dg)
-
     if dxg > 0
         if iteration % 2 == 0
             state.α = (dx' * dx) / dxg
@@ -200,16 +145,13 @@ function set_step!(state::IterationState, iteration::Integer)
             state.α = dxg / (dg' * dg)
         end
     else
-        state.α = 1e-5
+        state.α = state.α₀
     end
-
     state.α = max(min(state.α, 1e12), 1e-12)
 end
 
 function linear_search!(state::IterationState,
     bb::BBMethod, prob::FISTA, k::Integer)
-
-    loop_count = 1
 
     θ = (k - 1) / (k + 2)
     y = state.x + θ * (state.x - state.x_previous)
@@ -217,7 +159,8 @@ function linear_search!(state::IterationState,
     x_tmp = proximal(prob, state, w)
     f_tmp = objective_value(prob, x_tmp)
 
-    while loop_count <= 1000 && f_tmp > bb.Cval - 0.5 * state.α * bb.rhols * norm(x_tmp - y, 2)^2
+    loop_count = 1
+    while f_tmp > bb.Cval - 0.5 * state.α * bb.rhols * norm(x_tmp - y, 2)^2 && loop_count <= 10
         state.α *= 0.2
         loop_count += 1
         w .= y .- state.α .* gradient(prob, y)
@@ -227,7 +170,6 @@ function linear_search!(state::IterationState,
     Qp = bb.Q
     bb.Q = bb.gamma * Qp + 1
     bb.Cval = (bb.gamma * Qp * bb.Cval + f_tmp) / bb.Q
-    println(state.α)
 end
 
 function optimize(A, b, μ; iterations=1_000)
@@ -263,14 +205,12 @@ function test()
     results = optimize(A, b, μ; iterations=1000)
 
     it = 100
-
     plot(1:it,
         ((results.f_historical_values.-results.minimum)./results.minimum)[1:it],
-        dpi=300, yscale=:log10
+        dpi=300, yscale=:log10, label="FISTA with Barzilai Borwein"
     )
     ylabel!(L"$(f(x^k) - f^{*})/f^{*}$")
     xlabel!("Iterations")
-
 end
 
-test()
+@time test()
